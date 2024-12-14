@@ -1,0 +1,127 @@
+blueprint:
+  name: Kid Time Device Controller
+  description: Manage multiple devices with a universal "kid time" time bank and two passcodes for access.
+  domain: automation
+  input:
+    time_helper:
+      name: Time Bank Helper
+      description: The input_number helper representing the time bank (in minutes).
+      selector:
+        entity:
+          domain: input_number
+    devices:
+      name: Target Devices
+      description: List of devices to control.
+      selector:
+        target:
+          entity:
+            domain:
+              - switch
+              - light
+              - media_player
+    passcode_device:
+      name: Passcode Device
+      description: The MQTT device or virtual keypad (input_text) used to enter a passcode.
+      selector:
+        entity:
+          domain:
+            - sensor
+            - input_text
+    parent_passcode:
+      name: Parent Passcode
+      description: Passcode for parents to grant unlimited time.
+      selector:
+        text:
+          multiline: false
+    child_passcode:
+      name: Child Passcode
+      description: Passcode for children to use time from the time bank.
+      selector:
+        text:
+          multiline: false
+    daily_reset:
+      name: Time Bank Daily Reset
+      description: Time of day to reset the time bank.
+      selector:
+        time: {}
+    cooldown_times:
+      name: Cooldown Times for Devices
+      description: Set cooldown times for individual devices (in minutes).
+      selector:
+        object: {}
+
+mode: queued
+max_exceeded: silent
+
+action:
+  - alias: Reset Time Bank Daily
+    trigger:
+      - platform: time
+        at: !input daily_reset
+    action:
+      - service: input_number.set_value
+        data:
+          entity_id: !input time_helper
+          value: 1440  # Reset to full day (24 hours in minutes)
+
+  - alias: Handle Passcode Input
+    trigger:
+      - platform: state
+        entity_id: !input passcode_device
+    condition:
+      - condition: template
+        value_template: |
+          {{ trigger.to_state.state in [!input parent_passcode, !input child_passcode] }}
+    action:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.to_state.state == !input parent_passcode }}"
+            sequence:
+              - service: homeassistant.turn_on
+                target: !input devices
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.to_state.state == !input child_passcode }}"
+            sequence:
+              - repeat:
+                  while:
+                    - condition: template
+                      value_template: "{{ states(!input time_helper) | int > 0 }}"
+                  sequence:
+                    - service: homeassistant.turn_on
+                      target: !input devices
+                    - delay: "00:05:00"
+                    - service: input_number.decrement
+                      data:
+                        entity_id: !input time_helper
+      - service: mqtt.publish
+        data:
+          topic: "passcode/acknowledge"
+          payload: |
+            {{ "Access granted for " + trigger.to_state.state }}
+
+  - alias: Apply Cooldown After Use
+    trigger:
+      - platform: state
+        entity_id: !input devices
+        to: 'off'
+    action:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: |
+                  {{ trigger.entity_id in (!input cooldown_times.keys() | list) }}
+            sequence:
+              - delay: "00:{{ !input cooldown_times[trigger.entity_id] | int }}:00"
+              - service: homeassistant.turn_on
+                entity_id: "{{ trigger.entity_id }}"
+
+  - alias: Turn off devices when time is up
+    trigger:
+      - platform: numeric_state
+        entity_id: !input time_helper
+        below: 1
+    action:
+      - service: homeassistant.turn_off
+        target: !input devices
